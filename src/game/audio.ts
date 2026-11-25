@@ -20,8 +20,20 @@ const VOICE_FALLBACK_TEXT: Record<VoiceClipId, string> = {
   streak_6: '天呐彻底杀疯了！快叫老板结账，这台子归你了！',
 };
 
-// Gently pre-warm only the 2 most common callouts on unlock; higher streaks load on-demand
-const PRELOAD_ORDER: VoiceClipId[] = ['break_pot', 'streak_2'];
+// Pre-warm all 6 tiny pre-bundled static voice MP3s gently one-by-one (zero API cost, zero latency)
+const PRELOAD_ORDER: VoiceClipId[] = [
+  'break_pot',
+  'streak_2',
+  'streak_3',
+  'streak_4',
+  'streak_5',
+  'streak_6',
+];
+
+function getStaticVoiceUrl(clipId: VoiceClipId): string {
+  const base = (import.meta.env?.BASE_URL ?? '/').replace(/\/+$/, '');
+  return `${base}/voices/${clipId}.mp3?${VOICE_CACHE_QUERY}`;
+}
 
 class SoundEngine {
   private ctx: AudioContext | null = null;
@@ -33,7 +45,7 @@ class SoundEngine {
   private lastBallClackTime = 0;
   private lastRailThudTime = 0;
 
-  // Decoded studio voice-actor WAV cache & playback state
+  // Decoded studio voice-actor AudioBuffer cache & playback state
   private voiceBuffers = new Map<VoiceClipId, AudioBuffer>();
   private voiceFetching = new Map<VoiceClipId, Promise<AudioBuffer | null>>();
   private voiceApiAvailable = true;
@@ -76,7 +88,10 @@ class SoundEngine {
     return this.ctx;
   }
 
-  /** Build warm cinematic mastering chain (EQ + subtle hall reverb + compressor) for voice clips */
+  /**
+   * Build crisp, lightweight studio voice mastering bus (EQ + compressor + subtle room slapback).
+   * Uses a low-CPU DelayNode instead of heavy FFT ConvolverNode to stay silky smooth on all devices.
+   */
   private setupVoiceMasteringBus(ctx: AudioContext): void {
     const input = ctx.createGain();
     input.gain.value = 1.15;
@@ -85,48 +100,37 @@ class SoundEngine {
     const lowShelf = ctx.createBiquadFilter();
     lowShelf.type = 'lowshelf';
     lowShelf.frequency.value = 165;
-    lowShelf.gain.value = 2.4;
+    lowShelf.gain.value = 2.2;
 
     // Crisp vocal presence peak
     const presence = ctx.createBiquadFilter();
     presence.type = 'peaking';
     presence.frequency.value = 2850;
     presence.Q.value = 1.1;
-    presence.gain.value = 3.2;
+    presence.gain.value = 3.0;
 
     // Dynamics compressor for authoritative punch
     const compressor = ctx.createDynamicsCompressor();
     compressor.threshold.value = -16;
     compressor.knee.value = 12;
-    compressor.ratio.value = 3.5;
+    compressor.ratio.value = 3.2;
     compressor.attack.value = 0.005;
     compressor.release.value = 0.14;
 
     // Dry path
     const dryGain = ctx.createGain();
-    dryGain.gain.value = 0.94;
+    dryGain.gain.value = 0.96;
 
-    // Subtle epic hall reverb impulse (0.58s warm decay)
-    const sampleRate = ctx.sampleRate;
-    const irLen = Math.floor(sampleRate * 0.58);
-    const irBuffer = ctx.createBuffer(2, irLen, sampleRate);
-    for (let ch = 0; ch < 2; ch++) {
-      const data = irBuffer.getChannelData(ch);
-      for (let i = 0; i < irLen; i++) {
-        const t = i / irLen;
-        const env = Math.pow(1 - t, 2.8);
-        data[i] = (Math.random() * 2 - 1) * env * 0.5;
-      }
-    }
-    const convolver = ctx.createConvolver();
-    convolver.buffer = irBuffer;
+    // Lightweight billiard-hall room ambience (34ms subtle slapback)
+    const roomDelay = ctx.createDelay(0.1);
+    roomDelay.delayTime.value = 0.034;
 
     const wetFilter = ctx.createBiquadFilter();
     wetFilter.type = 'lowpass';
-    wetFilter.frequency.value = 2200;
+    wetFilter.frequency.value = 2100;
 
     const wetGain = ctx.createGain();
-    wetGain.gain.value = 0.18;
+    wetGain.gain.value = 0.11;
 
     input.connect(lowShelf);
     lowShelf.connect(presence);
@@ -135,8 +139,8 @@ class SoundEngine {
     compressor.connect(dryGain);
     dryGain.connect(ctx.destination);
 
-    compressor.connect(convolver);
-    convolver.connect(wetFilter);
+    compressor.connect(roomDelay);
+    roomDelay.connect(wetFilter);
     wetFilter.connect(wetGain);
     wetGain.connect(ctx.destination);
 
@@ -145,13 +149,6 @@ class SoundEngine {
 
   public unlock(): void {
     this.ensureContext();
-    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-      try {
-        window.speechSynthesis.getVoices();
-      } catch {
-        // noop
-      }
-    }
     if (!this.preloadStarted && !this.muted) {
       this.preloadStarted = true;
       void this.preloadVoicePack();
@@ -179,45 +176,66 @@ class SoundEngine {
     return this.muted;
   }
 
-  /** Fetch & decode a single studio voice-actor WAV from /api/voice/:clipId */
+  /** Try fetching and decoding an audio URL into an AudioBuffer */
+  private async tryFetchAudioUrl(url: string): Promise<AudioBuffer | 'rate_limited' | 'missing'> {
+    try {
+      const res = await fetch(url);
+      if (res.status === 429) {
+        const retryAfter = Number(res.headers.get('Retry-After')) || 35;
+        this.voiceRateLimitUntilMs = Date.now() + retryAfter * 1000;
+        return 'rate_limited';
+      }
+      if (!res.ok) return 'missing';
+      const contentType = (res.headers.get('content-type') ?? '').toLowerCase();
+      // Reject SPA HTML fallback pages returned for missing files on static hosts
+      if (contentType.includes('text/html') || contentType.includes('application/json')) {
+        return 'missing';
+      }
+      const arrayBuf = await res.arrayBuffer();
+      if (arrayBuf.byteLength < 512) return 'missing';
+      const ctx = this.ensureContext();
+      if (!ctx) return 'missing';
+      return await ctx.decodeAudioData(arrayBuf.slice(0));
+    } catch {
+      return 'missing';
+    }
+  }
+
+  /**
+   * Load studio voice-actor clip:
+   * 1. Pre-bundled static MP3 in /voices/<clipId>.mp3 (works everywhere: Cloudflare Pages, Nginx, offline, zero API calls)
+   * 2. Fallback to /api/voice/<clipId> only if static file is unavailable (dev server)
+   */
   private async fetchVoiceBuffer(clipId: VoiceClipId): Promise<AudioBuffer | null> {
-    if (!this.voiceApiAvailable || typeof fetch === 'undefined') return null;
+    if (typeof fetch === 'undefined') return null;
 
     const cached = this.voiceBuffers.get(clipId);
     if (cached) return cached;
-
-    if (Date.now() < this.voiceRateLimitUntilMs) return null;
 
     const existing = this.voiceFetching.get(clipId);
     if (existing) return existing;
 
     const task = (async () => {
       try {
-        const res = await fetch(`/api/voice/${clipId}?${VOICE_CACHE_QUERY}`);
-        if (res.status === 429) {
-          const retryAfter = Number(res.headers.get('Retry-After')) || 35;
-          this.voiceRateLimitUntilMs = Date.now() + retryAfter * 1000;
+        // 1. Static bundled MP3 first (instant, works on all static hosts without Node backend)
+        const staticResult = await this.tryFetchAudioUrl(getStaticVoiceUrl(clipId));
+        if (staticResult instanceof AudioBuffer) {
+          this.voiceBuffers.set(clipId, staticResult);
+          return staticResult;
+        }
+
+        // 2. Fallback to live server TTS endpoint only if available and not in cooldown
+        if (!this.voiceApiAvailable || Date.now() < this.voiceRateLimitUntilMs) {
           return null;
         }
-        if (!res.ok) {
-          // On static-only hosts (404) or missing key (503), stop hammering endpoint
-          if (res.status === 404 || res.status === 503) {
-            this.voiceApiAvailable = false;
-          }
-          return null;
+        const apiResult = await this.tryFetchAudioUrl(`/api/voice/${clipId}?${VOICE_CACHE_QUERY}`);
+        if (apiResult instanceof AudioBuffer) {
+          this.voiceBuffers.set(clipId, apiResult);
+          return apiResult;
         }
-        const contentType = res.headers.get('content-type') ?? '';
-        if (!contentType.includes('audio')) {
+        if (apiResult === 'missing') {
           this.voiceApiAvailable = false;
-          return null;
         }
-        const arrayBuf = await res.arrayBuffer();
-        const ctx = this.ensureContext();
-        if (!ctx) return null;
-        const decoded = await ctx.decodeAudioData(arrayBuf.slice(0));
-        this.voiceBuffers.set(clipId, decoded);
-        return decoded;
-      } catch {
         return null;
       } finally {
         this.voiceFetching.delete(clipId);
@@ -228,13 +246,12 @@ class SoundEngine {
     return task;
   }
 
-  /** Quietly pre-warm the 3 flagship voice clips one-by-one with gentle pacing */
+  /** Quietly pre-decode all 6 lightweight bundled voice MP3s with smooth frame pacing */
   private async preloadVoicePack(): Promise<void> {
     for (const clipId of PRELOAD_ORDER) {
-      if (!this.voiceApiAvailable || this.muted) return;
-      if (Date.now() < this.voiceRateLimitUntilMs) return;
+      if (this.muted) return;
       await this.fetchVoiceBuffer(clipId);
-      await new Promise((resolve) => window.setTimeout(resolve, 600));
+      await new Promise((resolve) => window.setTimeout(resolve, 120));
     }
   }
 
@@ -259,7 +276,7 @@ class SoundEngine {
     this.activeVoiceEndTime = 0;
   }
 
-  /** Fallback deep browser TTS only if /api/voice/:clipId is unavailable (e.g. static-only hosting) */
+  /** Last-resort browser speech fallback only if both static MP3 and API fail */
   private speakFallbackTTS(text: string, delayMs: number): void {
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
     window.setTimeout(() => {
@@ -290,9 +307,7 @@ class SoundEngine {
   }
 
   /**
-   * Play a studio-mastered Three Kingdoms voice-actor clip with priority management.
-   * Higher-priority callouts (streaks / pots / win) cleanly fade out lower-priority ones
-   * (strike / rail), while lower-priority cues never interrupt an active announcement.
+   * Play a studio-mastered colloquial Chinese voice-actor clip with priority management.
    */
   private playVoiceClip(clipId: VoiceClipId, priority: number, delayMs = 0): void {
     if (this.muted) return;
@@ -300,7 +315,6 @@ class SoundEngine {
     if (!ctx) return;
 
     const nowMs = performance.now();
-    // Do not interrupt a currently playing equal-or-higher priority voice line
     if (nowMs < this.activeVoiceEndTime && priority < this.activeVoicePriority) {
       return;
     }
@@ -313,13 +327,6 @@ class SoundEngine {
       }
 
       this.stopActiveVoice();
-      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-        try {
-          window.speechSynthesis.cancel();
-        } catch {
-          // noop
-        }
-      }
 
       const startAt = this.ctx.currentTime + Math.max(0, delayMs) / 1000;
       const src = this.ctx.createBufferSource();
@@ -353,14 +360,7 @@ class SoundEngine {
       return;
     }
 
-    if (!this.voiceApiAvailable) {
-      if (priority >= 3) {
-        this.speakFallbackTTS(VOICE_FALLBACK_TEXT[clipId], delayMs);
-      }
-      return;
-    }
-
-    // On-demand fetch for first-ever trigger if preload hasn't reached this clip yet
+    // Load bundled MP3 (or fallback API) on demand if preload is still in progress
     const requestedAt = performance.now();
     void this.fetchVoiceBuffer(clipId).then((buf) => {
       if (buf && performance.now() - requestedAt < 2600) {
