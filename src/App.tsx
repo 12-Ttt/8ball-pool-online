@@ -102,6 +102,7 @@ export default function App() {
   const [currentPlayer, setCurrentPlayer] = useState<PlayerIndex>(0);
   const [lastBreaker, setLastBreaker] = useState<PlayerIndex>(0);
   const [rackNumber, setRackNumber] = useState<number>(1);
+  const [matchScore, setMatchScore] = useState<[number, number]>([0, 0]);
   const [phase, setPhase] = useState<TurnPhase>('AIMING');
   const [isBreak, setIsBreak] = useState<boolean>(true);
   const [kitchenOnly, setKitchenOnly] = useState<boolean>(true);
@@ -194,6 +195,7 @@ export default function App() {
     currentPlayer,
     lastBreaker,
     rackNumber,
+    matchScore,
     phase,
     isBreak,
     kitchenOnly,
@@ -208,6 +210,7 @@ export default function App() {
     currentPlayer,
     lastBreaker,
     rackNumber,
+    matchScore,
     phase,
     isBreak,
     kitchenOnly,
@@ -338,6 +341,9 @@ export default function App() {
       setCurrentPlayer(payload.currentPlayer);
       setLastBreaker(payload.lastBreaker);
       setRackNumber(payload.rackNumber);
+      if (payload.matchScore) {
+        setMatchScore([payload.matchScore[0], payload.matchScore[1]]);
+      }
       setPhase(payload.phase);
       setIsBreak(payload.isBreak);
       setKitchenOnly(payload.kitchenOnly);
@@ -389,6 +395,7 @@ export default function App() {
         currentPlayer: override?.currentPlayer ?? st.currentPlayer,
         lastBreaker: override?.lastBreaker ?? st.lastBreaker,
         rackNumber: override?.rackNumber ?? st.rackNumber,
+        matchScore: override?.matchScore ?? st.matchScore,
         phase: override?.phase ?? st.phase,
         isBreak: override?.isBreak ?? st.isBreak,
         kitchenOnly: override?.kitchenOnly ?? st.kitchenOnly,
@@ -401,11 +408,11 @@ export default function App() {
     [],
   );
 
-  /** Start a fresh local / AI / practice game (supports alternating breaker & rack counter) */
+  /** Start a fresh local / AI / practice game (supports alternating breaker, rack counter & cumulative series score) */
   const startNewLocalGame = useCallback(
     (
       payload: LobbyStartPayload,
-      options?: { breaker?: PlayerIndex; rackNumber?: number },
+      options?: { breaker?: PlayerIndex; rackNumber?: number; keepMatchScore?: boolean },
     ) => {
       clearAIActivities();
       peerManagerRef.current?.destroy();
@@ -414,6 +421,9 @@ export default function App() {
       setPeerStatus('idle');
       setPeerError('');
       setLocalPlayerIndex(null);
+      if (!options?.keepMatchScore || payload.mode === 'practice') {
+        setMatchScore([0, 0]);
+      }
 
       const rack = createInitialRack();
       ballsRef.current = rack;
@@ -592,6 +602,7 @@ export default function App() {
                 currentPlayer: st.currentPlayer,
                 lastBreaker: st.lastBreaker,
                 rackNumber: st.rackNumber,
+                matchScore: [st.matchScore[0], st.matchScore[1]],
                 phase: resumePhase,
                 isBreak: st.isBreak,
                 kitchenOnly: st.kitchenOnly,
@@ -625,12 +636,24 @@ export default function App() {
             shotSeqRef.current = 0;
             activeRemoteShotSeqRef.current = 0;
 
+            const isSameRoomNextRack = st.mode === 'online' && st.phase === 'GAME_OVER';
+            const nextRackNum = isSameRoomNextRack ? st.rackNumber + 1 : 1;
+            const nextBreakerIdx: PlayerIndex = isSameRoomNextRack
+              ? st.lastBreaker === 0
+                ? 1
+                : 0
+              : 0;
+            const seriesScore: [number, number] = isSameRoomNextRack
+              ? [st.matchScore[0], st.matchScore[1]]
+              : [0, 0];
+
             noticeCounterRef.current += 1;
             const initialState: AuthoritativeStatePayload = {
               balls: serializeBalls(rack),
-              currentPlayer: 0,
-              lastBreaker: 0,
-              rackNumber: 1,
+              currentPlayer: nextBreakerIdx,
+              lastBreaker: nextBreakerIdx,
+              rackNumber: nextRackNum,
+              matchScore: seriesScore,
               phase: 'AIMING',
               isBreak: true,
               kitchenOnly: true,
@@ -639,7 +662,7 @@ export default function App() {
               winReason: '',
               notice: {
                 id: noticeCounterRef.current,
-                title: `联机成功 · 第 1 局 ${hostName} 开球`,
+                title: `联机成功 · 第 ${nextRackNum} 局 ${freshPlayers[nextBreakerIdx].name} 开球`,
                 detail: `${hostName} vs ${guestName} · 辅助线${cleanSettings.beginnerMode ? '开' : '关'}`,
                 tone: 'success',
               },
@@ -1033,7 +1056,7 @@ export default function App() {
             }
           }
 
-          soundEngine.playCueStrike(shot.power);
+          soundEngine.playCueStrike(shot.power, st.isBreak);
           cuePowerRef.current = 0;
           cueStrikeThrustRef.current = 0;
           setPowerUI(0);
@@ -1190,19 +1213,30 @@ export default function App() {
             setTimeLeft(st.settings.shotClockSeconds);
           }
 
+          const nextMatchScore: [number, number] = [st.matchScore[0], st.matchScore[1]];
+          if (
+            evalResult.nextPhase === 'GAME_OVER' &&
+            evalResult.winner !== null &&
+            !st.settings.practiceMode
+          ) {
+            nextMatchScore[evalResult.winner] += 1;
+            setMatchScore(nextMatchScore);
+          }
+
           if (evalResult.notice.tone === 'foul') {
             soundEngine.playFoul();
           } else if (evalResult.nextPhase === 'GAME_OVER') {
             soundEngine.playWin();
           }
 
-          // Broadcast authoritative final ball positions & rule result to online opponent
+          // Broadcast authoritative final ball positions, rules & cumulative room score
           if (st.mode === 'online' && shot?.isLocalAuthority) {
             const snapshot: AuthoritativeStatePayload = {
               balls: serializeBalls(ballsRef.current),
               currentPlayer: evalResult.nextPlayer,
               lastBreaker: st.lastBreaker,
               rackNumber: st.rackNumber,
+              matchScore: nextMatchScore,
               phase: evalResult.nextPhase,
               isBreak: evalResult.nextIsBreak,
               kitchenOnly: evalResult.kitchenOnly,
@@ -1229,15 +1263,64 @@ export default function App() {
     return () => cancelAnimationFrame(rafId);
   }, [applyAuthoritativeState, refreshAimPreview, spawnChalkBurst]);
 
-  // --- AI Opponent Turn Automation ---
+  // --- AI Opponent Turn Automation (Split cleanly by phase so AI_THINKING never self-cancels) ---
   useEffect(() => {
     if (mode !== 'ai' || currentPlayer !== 1) return;
-    if (phase !== 'AIMING' && phase !== 'BALL_IN_HAND') return;
 
-    clearAIActivities();
+    if (phase === 'BALL_IN_HAND') {
+      clearAIActivities();
+      const id = window.setTimeout(() => {
+        const spot = computeAIBallInHandSpot(
+          ballsRef.current,
+          stateRef.current.players[1].group,
+          stateRef.current.isBreak,
+          stateRef.current.kitchenOnly,
+        );
+        const cue = ballsRef.current.find((b) => b.id === 0);
+        if (cue) {
+          cue.x = spot.x;
+          cue.y = spot.y;
+          cue.pocketed = false;
+          cue.pocketAnim = 0;
+        }
+        setBallsSnapshot([...ballsRef.current]);
+        const nextId = window.setTimeout(() => {
+          setPhase('AI_THINKING');
+        }, 300);
+        aiTimersRef.current.push(nextId);
+      }, 450);
+      aiTimersRef.current.push(id);
+      return clearAIActivities;
+    }
 
-    const startAIAimingSequence = () => {
-      setPhase('AI_THINKING');
+    if (phase === 'AIMING') {
+      clearAIActivities();
+      const id = window.setTimeout(() => {
+        setPhase('AI_THINKING');
+      }, 380);
+      aiTimersRef.current.push(id);
+      return clearAIActivities;
+    }
+
+    if (phase === 'AI_THINKING') {
+      clearAIActivities();
+
+      // Safety: ensure cue ball is on table before AI computes shot
+      const cue = ballsRef.current.find((b) => b.id === 0);
+      if (cue && cue.pocketed) {
+        const spot = computeAIBallInHandSpot(
+          ballsRef.current,
+          stateRef.current.players[1].group,
+          false,
+          false,
+        );
+        cue.x = spot.x;
+        cue.y = spot.y;
+        cue.pocketed = false;
+        cue.pocketAnim = 0;
+        setBallsSnapshot([...ballsRef.current]);
+      }
+
       const decision = computeAIShot(
         ballsRef.current,
         stateRef.current.players[1].group,
@@ -1295,34 +1378,10 @@ export default function App() {
       };
 
       aiAnimRafRef.current = requestAnimationFrame(animateAI);
-    };
-
-    if (phase === 'BALL_IN_HAND') {
-      const id = window.setTimeout(() => {
-        const spot = computeAIBallInHandSpot(
-          ballsRef.current,
-          stateRef.current.players[1].group,
-          stateRef.current.isBreak,
-          stateRef.current.kitchenOnly,
-        );
-        const cue = ballsRef.current.find((b) => b.id === 0);
-        if (cue) {
-          cue.x = spot.x;
-          cue.y = spot.y;
-          cue.pocketed = false;
-          cue.pocketAnim = 0;
-        }
-        setBallsSnapshot([...ballsRef.current]);
-        const nextId = window.setTimeout(startAIAimingSequence, 320);
-        aiTimersRef.current.push(nextId);
-      }, 480);
-      aiTimersRef.current.push(id);
-    } else {
-      const id = window.setTimeout(startAIAimingSequence, 420);
-      aiTimersRef.current.push(id);
+      return clearAIActivities;
     }
 
-    return clearAIActivities;
+    return undefined;
   }, [clearAIActivities, currentPlayer, mode, phase, refreshAimPreview, triggerStrike]);
 
   // --- Shot Clock Countdown (Wall-Clock Accurate + Dual-Side Online Fail-Safe) ---
@@ -1656,6 +1715,7 @@ export default function App() {
           currentPlayer: nextBreaker,
           lastBreaker: nextBreaker,
           rackNumber: nextRack,
+          matchScore: [stateRef.current.matchScore[0], stateRef.current.matchScore[1]],
           phase: 'AIMING',
           isBreak: true,
           kitchenOnly: true,
@@ -1665,7 +1725,7 @@ export default function App() {
           notice: {
             id: noticeCounterRef.current,
             title: `第 ${nextRack} 局 · ${freshPlayers[nextBreaker].name} 开球`,
-            detail: '双方轮换开球权',
+            detail: `当前总比分 ${stateRef.current.matchScore[0]} : ${stateRef.current.matchScore[1]} · 双方轮换开球权`,
             tone: 'success',
           },
         };
@@ -1693,8 +1753,8 @@ export default function App() {
         clothTheme: settings.clothTheme,
       },
       isPractice
-        ? { breaker: 0, rackNumber: 1 }
-        : { breaker: nextBreaker, rackNumber: nextRack },
+        ? { breaker: 0, rackNumber: 1, keepMatchScore: false }
+        : { breaker: nextBreaker, rackNumber: nextRack, keepMatchScore: true },
     );
   };
 
@@ -1739,6 +1799,7 @@ export default function App() {
     setLocalPlayerIndex(null);
     setRematchPending(false);
     setOpponentRequestedRematch(false);
+    setMatchScore([0, 0]);
 
     if (mode === 'online') {
       setMode('local');
@@ -1873,56 +1934,97 @@ export default function App() {
   const activeStreakCount =
     phase !== 'GAME_OVER' ? activeStreakPlayer.stats.currentStreak : 0;
   const showStreakCounter = activeStreakCount >= 2;
-  const streakTierLabel =
-    activeStreakCount >= 6
-      ? '清台大师'
-      : activeStreakCount >= 4
-        ? '势不可挡'
-        : activeStreakCount >= 3
-          ? '手感火热'
-          : '连杆起势';
+  const streakTierLabel = soundEngine.pickStreakLine(Math.max(2, activeStreakCount)).title;
 
   const [streakBurst, setStreakBurst] = useState<{
     id: number;
     count: number;
     playerName: string;
-    tierLabel: string;
+    epicTitle: string;
+    badge: string;
+    tagLabel: string;
   } | null>(null);
   const lastStreakTriggerRef = useRef<{ player: PlayerIndex; count: number }>({
     player: 0,
     count: 0,
   });
+  const lastBreakNoticeIdRef = useRef<number | null>(null);
+  const prevIsBreakRef = useRef<boolean>(isBreak);
 
   useEffect(() => {
-    if (phase === 'GAME_OVER' || activeStreakCount < 2) {
+    const wasBreak = prevIsBreakRef.current;
+    prevIsBreakRef.current = isBreak;
+
+    if (phase === 'GAME_OVER') {
+      lastStreakTriggerRef.current = { player: currentPlayer, count: 0 };
+      setStreakBurst(null);
+      return;
+    }
+
+    // 1. Break-and-pot ("开球有下") callout — works in local, AI, online, and practice modes
+    const noticeId = notice?.id ?? null;
+    const isStandardBreakPot = Boolean(
+      notice &&
+        noticeId !== lastBreakNoticeIdRef.current &&
+        (notice.title.startsWith('开球进球') || notice.title.startsWith('开球进黑 8')),
+    );
+    const isPracticeBreakPot = Boolean(
+      wasBreak &&
+        !isBreak &&
+        activeStreakCount >= 1 &&
+        noticeId !== null &&
+        noticeId !== lastBreakNoticeIdRef.current,
+    );
+
+    if (isStandardBreakPot || isPracticeBreakPot) {
+      lastBreakNoticeIdRef.current = noticeId;
       lastStreakTriggerRef.current = { player: currentPlayer, count: activeStreakCount };
-      if (phase === 'GAME_OVER') {
-        setStreakBurst(null);
-      }
+      const callout = soundEngine.playBreakPotCallout();
+      const burstId = Date.now();
+      setStreakBurst({
+        id: burstId,
+        count: Math.max(1, activeStreakCount),
+        playerName: activeStreakPlayer.name,
+        epicTitle: callout.title,
+        badge: callout.badge,
+        tagLabel: activeStreakCount >= 2 ? `开球连下 ${activeStreakCount} 球` : '开球有下',
+      });
+      const timer = window.setTimeout(() => {
+        setStreakBurst((cur) => (cur && cur.id === burstId ? null : cur));
+      }, 2400);
+      return () => window.clearTimeout(timer);
+    }
+
+    // 2. Regular shots: only 2+ consecutive pots (连杆) trigger voice callout + pop-up
+    if (activeStreakCount < 2) {
+      lastStreakTriggerRef.current = { player: currentPlayer, count: activeStreakCount };
       return;
     }
 
     const prev = lastStreakTriggerRef.current;
-    const shouldBurst =
+    const isFreshIncrease =
       prev.player !== currentPlayer || activeStreakCount > prev.count;
     lastStreakTriggerRef.current = { player: currentPlayer, count: activeStreakCount };
 
-    if (!shouldBurst) return;
+    if (!isFreshIncrease) return;
 
+    const callout = soundEngine.playStreakCallout(activeStreakCount);
     const burstId = Date.now();
     setStreakBurst({
       id: burstId,
       count: activeStreakCount,
       playerName: activeStreakPlayer.name,
-      tierLabel: streakTierLabel,
+      epicTitle: callout.title,
+      badge: callout.badge,
+      tagLabel: `${activeStreakCount} 连杆`,
     });
 
     const timer = window.setTimeout(() => {
       setStreakBurst((cur) => (cur && cur.id === burstId ? null : cur));
-    }, 2150);
+    }, 2400);
 
     return () => window.clearTimeout(timer);
-  }, [activeStreakCount, activeStreakPlayer.name, currentPlayer, phase, streakTierLabel]);
+  }, [activeStreakCount, activeStreakPlayer.name, currentPlayer, isBreak, notice, phase]);
 
   return (
     <div className="min-h-screen bg-[#0e1014] text-[#f3efe6] flex flex-col">
@@ -2027,6 +2129,7 @@ export default function App() {
               chatBubbles={chatBubbles}
               localPlayerIndex={localPlayerIndex}
               rackNumber={rackNumber}
+              matchScore={matchScore}
             />
           </div>
 
@@ -2147,15 +2250,10 @@ export default function App() {
                       <Flame className="animate-streak-flame w-7 h-7 sm:w-8 sm:h-8 text-[#fde047] fill-[#f97316]" />
                     </div>
 
-                    {/* Bold streak callout */}
+                    {/* Bold Three Kingdoms Kill style streak callout */}
                     <div className="relative z-10 pr-1">
-                      <div className="flex items-baseline gap-2">
-                        <span className="font-mono-num text-3xl sm:text-4xl font-extrabold leading-none text-[#fef3c7] drop-shadow-[0_0_14px_rgba(249,115,22,0.85)]">
-                          {streakBurst.count}
-                        </span>
-                        <span className="text-xl sm:text-2xl font-extrabold tracking-wide text-[#fb923c] drop-shadow-[0_2px_10px_rgba(234,88,12,0.65)] whitespace-nowrap">
-                          连杆！
-                        </span>
+                      <div className="text-xl sm:text-2xl font-extrabold tracking-wider text-[#fef3c7] drop-shadow-[0_0_16px_rgba(249,115,22,0.85)] whitespace-nowrap">
+                        {streakBurst.epicTitle}！
                       </div>
                       <div className="mt-1 flex items-center gap-2 text-xs sm:text-sm font-semibold">
                         <span className="text-[#f3efe6] max-w-[140px] truncate">
@@ -2164,8 +2262,8 @@ export default function App() {
                         <span className="text-[#fb923c]/60" aria-hidden="true">
                           ·
                         </span>
-                        <span className="text-[#fde68a] tracking-wide whitespace-nowrap">
-                          {streakBurst.tierLabel}
+                        <span className="font-mono-num text-[#fb923c] whitespace-nowrap">
+                          {streakBurst.tagLabel}
                         </span>
                       </div>
                     </div>
@@ -2388,6 +2486,7 @@ export default function App() {
           winner={winner}
           winReason={winReason}
           players={players}
+          matchScore={matchScore}
           nextBreakerName={players[lastBreaker === 0 ? 1 : 0].name}
           nextRackNumber={rackNumber + 1}
           isOnline={mode === 'online'}

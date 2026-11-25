@@ -107,6 +107,7 @@ export interface AuthoritativeStatePayload {
   currentPlayer: PlayerIndex;
   lastBreaker: PlayerIndex;
   rackNumber: number;
+  matchScore?: [number, number];
   phase: TurnPhase;
   isBreak: boolean;
   kitchenOnly: boolean;

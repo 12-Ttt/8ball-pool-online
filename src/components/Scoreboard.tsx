@@ -24,6 +24,7 @@ interface ScoreboardProps {
   chatBubbles: Partial<Record<PlayerIndex, ChatBubble>>;
   localPlayerIndex: PlayerIndex | null;
   rackNumber?: number;
+  matchScore?: [number, number];
 }
 
 const SOLID_IDS = [1, 2, 3, 4, 5, 6, 7];
@@ -160,6 +161,7 @@ export const Scoreboard: React.FC<ScoreboardProps> = ({
   chatBubbles,
   localPlayerIndex,
   rackNumber = 1,
+  matchScore = [0, 0],
 }) => {
   const showClock = shotClockSeconds > 0 && !practiceMode && phase !== 'GAME_OVER';
   const isUrgent = showClock && timeLeft <= 5;
@@ -179,26 +181,48 @@ export const Scoreboard: React.FC<ScoreboardProps> = ({
           bubble={chatBubbles[0]}
         />
 
-        {/* Center Shot Clock / Turn Divider */}
-        <div className="flex sm:flex-col items-center justify-between sm:justify-center px-3.5 py-2 rounded-xl bg-[#14171d] border border-white/8 sm:w-36 shrink-0">
+        {/* Center Cumulative Series Score / Shot Clock Divider */}
+        <div className="flex sm:flex-col items-center justify-between sm:justify-center px-3.5 py-2 rounded-xl bg-[#14171d] border border-white/8 sm:w-40 shrink-0 gap-1.5 sm:gap-1">
+          {!practiceMode && (
+            <div className="flex items-center justify-center gap-2 leading-none">
+              <span
+                className={`font-mono-num text-lg sm:text-xl font-extrabold tabular-nums ${
+                  matchScore[0] > matchScore[1] ? 'text-[#d4a853]' : 'text-[#f3efe6]'
+                }`}
+              >
+                {matchScore[0]}
+              </span>
+              <span className="text-xs font-bold text-[#626b7c]" aria-hidden="true">
+                :
+              </span>
+              <span
+                className={`font-mono-num text-lg sm:text-xl font-extrabold tabular-nums ${
+                  matchScore[1] > matchScore[0] ? 'text-[#d4a853]' : 'text-[#f3efe6]'
+                }`}
+              >
+                {matchScore[1]}
+              </span>
+            </div>
+          )}
+
           {showClock ? (
-            <>
-              <div className="flex items-center gap-1.5">
+            <div className="flex sm:flex-col items-center gap-2 sm:gap-1 sm:w-full">
+              <div className="flex items-center gap-1">
                 <Clock
-                  className={`w-3.5 h-3.5 ${isUrgent ? 'text-[#f87171]' : 'text-[#d4a853]'}`}
+                  className={`w-3 h-3 ${isUrgent ? 'text-[#f87171]' : 'text-[#d4a853]'}`}
                 />
                 <span
-                  className={`font-mono-num text-base font-bold ${
+                  className={`font-mono-num text-xs font-bold ${
                     isUrgent ? 'text-[#f87171]' : 'text-[#f3efe6]'
                   }`}
                 >
                   {Math.ceil(timeLeft)}s
                 </span>
-                <span className="text-[10px] text-[#8d96a6] font-mono-num">
-                  第{rackNumber}局
+                <span className="text-[10px] text-[#8d96a6] font-mono-num whitespace-nowrap">
+                  · 第{rackNumber}局
                 </span>
               </div>
-              <div className="w-24 sm:w-full h-1.5 rounded-full bg-white/8 overflow-hidden sm:mt-1.5">
+              <div className="w-20 sm:w-full h-1.5 rounded-full bg-white/8 overflow-hidden">
                 <div
                   className={`h-full transition-[width] duration-150 ${
                     isUrgent ? 'bg-[#ef4444]' : 'bg-[#d4a853]'
@@ -206,13 +230,13 @@ export const Scoreboard: React.FC<ScoreboardProps> = ({
                   style={{ width: `${clockPct}%` }}
                 />
               </div>
-            </>
+            </div>
           ) : (
-            <div className="text-center w-full">
+            <div className="text-right sm:text-center sm:w-full">
               <div className="text-[11px] text-[#8d96a6] whitespace-nowrap font-mono-num">
-                {practiceMode ? '中式八球 · 练球' : `中式八球 · 第 ${rackNumber} 局`}
+                {practiceMode ? '中式八球 · 练球' : `第 ${rackNumber} 局 · 总比分`}
               </div>
-              <div className="text-xs font-semibold text-[#f3efe6] mt-0.5 whitespace-nowrap">
+              <div className="text-[11px] font-semibold text-[#d8dde6] mt-0.5 whitespace-nowrap">
                 {phase === 'BALL_IN_HAND'
                   ? '自由球摆位'
                   : phase === 'SHOOTING'

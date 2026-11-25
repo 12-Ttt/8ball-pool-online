@@ -875,6 +875,7 @@ export const GameOverModal: React.FC<{
   winner: PlayerIndex;
   winReason: string;
   players: [PlayerInfo, PlayerInfo];
+  matchScore: [number, number];
   nextBreakerName: string;
   nextRackNumber: number;
   isOnline: boolean;
@@ -886,6 +887,7 @@ export const GameOverModal: React.FC<{
   winner,
   winReason,
   players,
+  matchScore,
   nextBreakerName,
   nextRackNumber,
   isOnline,
@@ -908,9 +910,44 @@ export const GameOverModal: React.FC<{
           <div className="w-10 h-10 rounded-xl bg-[#d4a853]/15 flex items-center justify-center shrink-0">
             <Trophy className="w-5 h-5 text-[#d4a853]" />
           </div>
-          <div>
+          <div className="min-w-0 flex-1">
             <div className="text-sm font-semibold text-[#f3efe6]">{winPlayer.name} 获胜</div>
             <div className="text-xs text-[#9ea6b4] mt-0.5">{winReason}</div>
+          </div>
+        </div>
+
+        {/* Cumulative Room / Session Series Score */}
+        <div className="px-4 py-3 rounded-xl bg-[#101319] border border-white/10 flex items-center justify-between gap-3">
+          <div className="min-w-0 flex-1 text-left">
+            <div className="text-[11px] text-[#8d96a6]">
+              {isOnline ? '本房间累计总比分' : '当前对战累计总比分'}
+            </div>
+            <div className="text-xs font-medium text-[#f3efe6] truncate mt-0.5">
+              {players[0].name}
+            </div>
+          </div>
+          <div className="flex items-center gap-2.5 px-3 py-1.5 rounded-lg bg-[#181c24] border border-white/8 shrink-0">
+            <span
+              className={`font-mono-num text-2xl font-extrabold leading-none tabular-nums ${
+                matchScore[0] >= matchScore[1] ? 'text-[#d4a853]' : 'text-[#f3efe6]'
+              }`}
+            >
+              {matchScore[0]}
+            </span>
+            <span className="text-sm font-bold text-[#626b7c]">:</span>
+            <span
+              className={`font-mono-num text-2xl font-extrabold leading-none tabular-nums ${
+                matchScore[1] >= matchScore[0] ? 'text-[#d4a853]' : 'text-[#f3efe6]'
+              }`}
+            >
+              {matchScore[1]}
+            </span>
+          </div>
+          <div className="min-w-0 flex-1 text-right">
+            <div className="text-[11px] text-[#8d96a6]">继续同房将持续累计</div>
+            <div className="text-xs font-medium text-[#f3efe6] truncate mt-0.5">
+              {players[1].name}
+            </div>
           </div>
         </div>
 

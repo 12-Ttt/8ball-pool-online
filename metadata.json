@@ -2,5 +2,7 @@
   "name": "金杆八球 · 2D 美式台球对战",
   "description": "高精度物理引擎驱动的纯前端 2D 美式 8 球台球应用，支持同屏双人、PeerJS 点对点在线联机与双档人机对战。",
   "requestFramePermissions": [],
-  "majorCapabilities": []
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }
