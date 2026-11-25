@@ -69,8 +69,8 @@ type RelayEnvelope =
   | { kind: 'ping'; from: string }
   | { kind: 'app'; from: string; payload: PeerMessage };
 
-const WEBRTC_GRACE_MS = 2600; // If WebRTC P2P hasn't opened in 2.6s (VPN/NAT), auto-switch to WSS TLS relay!
-const TOTAL_JOIN_TIMEOUT_MS = 16000;
+const WEBRTC_GRACE_MS = 2400; // If WebRTC P2P hasn't opened in 2.4s (VPN/NAT), auto-switch to multi-broker WSS relay
+const TOTAL_JOIN_TIMEOUT_MS = 20000;
 
 export class PeerRoomManager {
   private peer: Peer | null = null;
@@ -263,14 +263,20 @@ export class PeerRoomManager {
     const triggerRelayFallback = () => {
       if (relayFallbackTriggered || this.activeTransport !== 'none') return;
       relayFallbackTriggered = true;
-      this.callbacks.onStatusChange('joining', '直连受限，自动切换加密中继通道...');
+      const readyCount = this.relay?.getReadyCount() ?? 0;
+      this.callbacks.onStatusChange(
+        'joining',
+        readyCount > 0
+          ? `直连受限，已接入云端中继（${readyCount} 节点），正在呼叫房主...`
+          : '直连受限，正在接入云端中继通道...',
+      );
 
       const sendJoinReq = () => {
         if (this.activeTransport !== 'none') return;
         this.publishRelay({ kind: 'join_req', from: this.sessionId });
       };
 
-      if (this.relay?.isReady()) {
+      if (readyCount > 0) {
         sendJoinReq();
       }
       this.relayJoinRetryTimer = window.setInterval(() => {
@@ -282,13 +288,17 @@ export class PeerRoomManager {
           return;
         }
         sendJoinReq();
-      }, 1200);
+      }, 1000);
     };
 
-    // 1. Pre-warm WSS TLS relay socket immediately so fallback is instantaneous
-    this.startRelayChannel(() => {
+    // 1. Pre-warm all WSS TLS relay brokers in parallel so fallback is instantaneous
+    this.startRelayChannel((brokerIdx, readyCount) => {
       if (relayFallbackTriggered && this.activeTransport === 'none') {
-        this.publishRelay({ kind: 'join_req', from: this.sessionId });
+        this.callbacks.onStatusChange(
+          'joining',
+          `已接入云端中继（${readyCount} 节点），正在呼叫房主...`,
+        );
+        this.publishRelay({ kind: 'join_req', from: this.sessionId }, brokerIdx);
       }
     });
 
@@ -316,34 +326,39 @@ export class PeerRoomManager {
       triggerRelayFallback();
     });
 
-    // 3. If WebRTC doesn't open within 3.2s (e.g. VPN / Clash / Symmetric NAT), auto-fallback to WSS relay!
+    // 3. If WebRTC doesn't open within 2.4s (e.g. VPN / Clash / Symmetric NAT), auto-fallback to WSS relay!
     this.fallbackTimer = window.setTimeout(() => {
       if (this.activeTransport === 'none') {
         triggerRelayFallback();
       }
     }, WEBRTC_GRACE_MS);
 
-    // 4. Overall hard timeout (16s) if room genuinely does not exist or host closed page
+    // 4. Overall hard timeout (20s) with clear diagnostics
     this.joinTimer = window.setTimeout(() => {
       if (this.activeTransport === 'none') {
+        const relayReachable = Boolean(
+          this.relay && (this.relay.getReadyCount() > 0 || this.relay.hasEverConnected()),
+        );
         this.destroy();
         this.callbacks.onStatusChange(
           'error',
-          '连接房主超时：请确认 6 位房间号无误，且房主仍保持房间页面开启',
+          relayReachable
+            ? '连接房主超时：云端中继已就绪，但未收到房主响应，请确认房主页面保持开启且 6 位房号无误'
+            : '连接超时：当前网络拦截了云端中继通道，请尝试切换 Wi-Fi / 流量或调整代理设置后重试',
         );
       }
     }, TOTAL_JOIN_TIMEOUT_MS);
   }
 
-  private startRelayChannel(onReady: () => void): void {
+  private startRelayChannel(onReady: (brokerIdx: number, readyCount: number) => void): void {
     const relay = new WssRelayClient(this.getInboundTopic(), {
-      onReady: () => {
+      onReady: (brokerIdx, readyCount) => {
         if (this.relay !== relay) return;
-        onReady();
+        onReady(brokerIdx, readyCount);
       },
-      onMessage: (_topic, payload) => {
+      onMessage: (_topic, payload, brokerIdx) => {
         if (this.relay !== relay) return;
-        this.handleRelayPayload(payload);
+        this.handleRelayPayload(payload, brokerIdx);
       },
       onError: () => {
         // PeerJS may still succeed even if relay fails
@@ -352,12 +367,12 @@ export class PeerRoomManager {
     this.relay = relay;
   }
 
-  private publishRelay(env: RelayEnvelope): void {
+  private publishRelay(env: RelayEnvelope, preferredBrokerIdx?: number): void {
     if (!this.relay) return;
-    this.relay.publish(this.getOutboundTopic(), JSON.stringify(env));
+    this.relay.publish(this.getOutboundTopic(), JSON.stringify(env), preferredBrokerIdx);
   }
 
-  private handleRelayPayload(raw: string): void {
+  private handleRelayPayload(raw: string, brokerIdx: number): void {
     let env: RelayEnvelope;
     try {
       env = JSON.parse(raw) as RelayEnvelope;
@@ -368,23 +383,24 @@ export class PeerRoomManager {
 
     this.lastRelayActivity = Date.now();
 
-    // Host receives guest relay join request -> lock relay transport & ack!
+    // Host receives guest relay join request -> lock onto the exact shared broker & ack!
     if (env.kind === 'join_req' && this.isHost) {
-      if (this.activeTransport === 'none' || (this.activeTransport === 'relay' && this.remoteSessionId === env.from)) {
-        const isFirstLock = this.activeTransport === 'none';
+      if (this.activeTransport === 'none') {
         this.remoteSessionId = env.from;
-        this.publishRelay({ kind: 'join_ack', from: this.sessionId });
-        if (isFirstLock) {
-          this.lockTransport('relay');
-        }
+        this.relay?.lockBroker(brokerIdx);
+        this.publishRelay({ kind: 'join_ack', from: this.sessionId }, brokerIdx);
+        this.lockTransport('relay');
+      } else if (this.activeTransport === 'relay' && this.remoteSessionId === env.from) {
+        this.publishRelay({ kind: 'join_ack', from: this.sessionId }, brokerIdx);
       }
       return;
     }
 
-    // Guest receives host relay ack -> lock relay transport!
+    // Guest receives host relay ack -> lock onto the exact shared broker!
     if (env.kind === 'join_ack' && !this.isHost) {
       if (this.activeTransport === 'none') {
         this.remoteSessionId = env.from;
+        this.relay?.lockBroker(brokerIdx);
         this.lockTransport('relay');
       }
       return;
@@ -395,7 +411,11 @@ export class PeerRoomManager {
     if (env.kind === 'bye') {
       this.clearTimers();
       this.activeTransport = 'none';
-      this.callbacks.onStatusChange('disconnected', '对手已离开房间');
+      this.remoteSessionId = '';
+      if (this.isHost && this.relay) {
+        this.relay.unlockAllBrokers();
+      }
+      this.callbacks.onStatusChange('disconnected', '对手已离开房间（输入原房号可重连）');
       this.callbacks.onDisconnected();
       return;
     }
@@ -499,9 +519,13 @@ export class PeerRoomManager {
       this.relayHeartbeatTimer = window.setInterval(() => {
         if (this.activeTransport !== 'relay') return;
         this.publishRelay({ kind: 'ping', from: this.sessionId });
-        if (Date.now() - this.lastRelayActivity > 18000) {
+        if (Date.now() - this.lastRelayActivity > 24000) {
           this.clearTimers();
           this.activeTransport = 'none';
+          this.remoteSessionId = '';
+          if (this.isHost && this.relay) {
+            this.relay.unlockAllBrokers();
+          }
           this.callbacks.onStatusChange('disconnected', '对手连接已超时断开');
           this.callbacks.onDisconnected();
         }
